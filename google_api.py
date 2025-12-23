@@ -193,9 +193,7 @@ def edit_event(event_id, title=None, date=None, time=None, description=None, loc
         service = get_calendar_service()
 
         # Get existing event
-        event = service.events().get(calendarId='primary', eventId=event_id).execute()
-
-        # Update fields if provided
+        event = service.events().get(calendarId='primary', eventId=event_id).execute()        # Update fields if provided
         if title:
             event['summary'] = title
         if description is not None:
@@ -205,13 +203,40 @@ def edit_event(event_id, title=None, date=None, time=None, description=None, loc
 
         # Handle date/time changes
         if date or time:
-            if date and time:
-                new_start = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
-                event['start'] = {'dateTime': new_start.isoformat(), 'timeZone': 'Asia/Jerusalem'}
-                event['end'] = {'dateTime': (new_start + timedelta(hours=1)).isoformat(), 'timeZone': 'Asia/Jerusalem'}
-            elif date:
-                event['start'] = {'date': date}
-                event['end'] = {'date': date}
+            # Get current event start (existing date/time)
+            existing_start = event['start']
+            is_all_day = 'date' in existing_start  # All-day if 'date' key exists
+            
+            if is_all_day:
+                # Currently an all-day event
+                if date:
+                    # Update to new date (keep as all-day)
+                    event['start'] = {'date': date}
+                    event['end'] = {'date': (datetime.fromisoformat(date) + timedelta(days=1)).date().isoformat()}
+                # If time is provided but no date, we need to convert to timed event
+                # But we can't do this without a date, so ignore time-only change for all-day events
+            else:
+                # Currently a timed event
+                existing_datetime = datetime.fromisoformat(existing_start['dateTime'])
+                existing_tz = ZoneInfo(existing_start.get('timeZone', 'Asia/Jerusalem'))
+                
+                # Extract current date and time
+                current_date = existing_datetime.date()
+                current_time = existing_datetime.time()
+                
+                # Use new values if provided, otherwise keep existing
+                new_date = datetime.fromisoformat(date).date() if date else current_date
+                new_time = datetime.strptime(time, "%H:%M").time() if time else current_time
+                
+                # Combine and update
+                new_datetime = datetime.combine(new_date, new_time).replace(tzinfo=existing_tz)
+                
+                # Calculate duration from existing event
+                existing_end = datetime.fromisoformat(event['end']['dateTime'])
+                duration = existing_end - existing_datetime
+                
+                event['start'] = {'dateTime': new_datetime.isoformat(), 'timeZone': str(existing_tz)}
+                event['end'] = {'dateTime': (new_datetime + duration).isoformat(), 'timeZone': str(existing_tz)}
 
         updated_event = service.events().update(calendarId='primary', eventId=event_id, body=event).execute()
         logger.info(f"Updated event: {updated_event.get('summary')}")
