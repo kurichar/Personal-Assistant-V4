@@ -1,0 +1,22 @@
+# Virtual environment
+venv/
+
+# Environment variables and secrets
+.env
+credentials.json
+token.json
+bot_token.txt
+
+# Python
+*.pyc
+__pycache__/
+
+# Data files
+conversations.json
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
