@@ -5,6 +5,7 @@ Uses LangChain message format throughout.
 
 import logging
 import json
+import re
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
@@ -20,6 +21,36 @@ from config import TELEGRAM_BOT_TOKEN
 import llm_handler
 import tools
 import agent_logger
+import session
+
+
+# ============================================================
+# HTML FORMATTING HELPERS
+# ============================================================
+
+def markdown_to_html(text: str) -> str:
+    """
+    Convert basic markdown to Telegram HTML format.
+    Handles: **bold**, *italic*, `code`
+    """
+    if not text:
+        return text
+
+    # Escape HTML special chars first (except our markdown)
+    text = text.replace('&', '&amp;')
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
+
+    # Convert markdown to HTML
+    # **bold** -> <b>bold</b>
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    # *italic* -> <i>italic</i> (but not if part of **)
+    text = re.sub(r'(?<!\*)\*([^*]+?)\*(?!\*)', r'<i>\1</i>', text)
+    # `code` -> <code>code</code>
+    text = re.sub(r'`([^`]+?)`', r'<code>\1</code>', text)
+
+    return text
+
 
 # Logging setup
 logging.basicConfig(
@@ -74,10 +105,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     clear_conversation(user_id)
     pending_proposals.pop(user_id, None)
+    session.clear_session(user_id)  # Clear session state (cached IDs, freshness)
 
     await update.message.reply_text(
         "Hi! I'm your personal assistant. I can help you manage your calendar and tasks.\n"
-        "Just talk to me naturally and I'll do my best to help!"
+        "Just talk to me naturally and I'll do my best to help!",
+        parse_mode='HTML'
     )
 
 
@@ -114,7 +147,10 @@ async def process_llm_response(update: Update, user_id: int, max_iterations: int
             # No tool calls - just a text response
             add_message(user_id, ai_msg)
             agent_logger.log_final_response(ai_msg.content)
-            await update.message.reply_text(ai_msg.content or "I'm not sure how to help with that.")
+            await update.message.reply_text(
+                markdown_to_html(ai_msg.content) or "I'm not sure how to help with that.",
+                parse_mode='HTML'
+            )
             return
 
         logger.info(f"LLM requested {len(ai_msg.tool_calls)} tool(s) (iteration {iteration + 1})")
@@ -132,6 +168,38 @@ async def process_llm_response(update: Update, user_id: int, max_iterations: int
 
             # Check if this is a proposal tool (needs confirmation)
             if tool_name in tools.PROPOSAL_TOOL_NAMES:
+                # Validate proposal against session state (ID exists, data fresh)
+                user_session = session.get_session(user_id)
+                validation_error = None
+
+                # Validate event proposals
+                if tool_name in ("propose_edit_event", "propose_delete_event"):
+                    event_id = tool_args.get("event_id")
+                    if event_id:
+                        valid, error = user_session.validate_event_proposal(event_id)
+                        if not valid:
+                            validation_error = error
+
+                # Validate task proposals
+                elif tool_name in ("propose_edit_task", "propose_delete_task", "propose_complete_task"):
+                    task_id = tool_args.get("task_id")
+                    if task_id:
+                        valid, error = user_session.validate_task_proposal(task_id)
+                        if not valid:
+                            validation_error = error
+
+                # If validation failed, return error to LLM instead of queuing
+                if validation_error:
+                    logger.warning(f"Proposal validation failed: {validation_error}")
+                    add_message(user_id, llm_handler.create_tool_message(
+                        tool_id,
+                        json.dumps({
+                            "error": validation_error,
+                            "action_required": "Fetch fresh data before proposing changes"
+                        }, ensure_ascii=False)
+                    ))
+                    continue  # Skip this proposal, let LLM retry with fresh data
+
                 # Execute the proposal tool to get the proposal data
                 proposal_tool = next(t for t in tools.PROPOSAL_TOOLS if t.name == tool_name)
                 proposal = proposal_tool.invoke(tool_args)
@@ -151,8 +219,15 @@ async def process_llm_response(update: Update, user_id: int, max_iterations: int
                 # Log tool execution
                 agent_logger.log_tool_execution(tool_name, tool_args, result)
 
+                # Update session state with fetched data
+                user_session = session.get_session(user_id)
+                if tool_name in ("get_calendar_events", "get_today_events"):
+                    user_session.update_from_calendar_read(result)
+                elif tool_name == "get_tasks":
+                    user_session.update_from_tasks_read(result)
+
                 # Add tool result to conversation
-                add_message(user_id, llm_handler.create_tool_message(tool_id, json.dumps(result)))
+                add_message(user_id, llm_handler.create_tool_message(tool_id, json.dumps(result, ensure_ascii=False)))
 
         # If we have proposals, queue them and show the first one
         if proposals_to_queue:
@@ -161,7 +236,7 @@ async def process_llm_response(update: Update, user_id: int, max_iterations: int
             return  # Wait for user to confirm/cancel/change
 
     # Hit max iterations
-    await update.message.reply_text("I'm having trouble processing that. Can you try again?")
+    await update.message.reply_text("I'm having trouble processing that. Can you try again?", parse_mode='HTML')
 
 
 async def show_next_proposal(update: Update, user_id: int):
@@ -170,7 +245,7 @@ async def show_next_proposal(update: Update, user_id: int):
 
     if not queue:
         # No more proposals - let user know we're done
-        await update.message.reply_text("All done!")
+        await update.message.reply_text("All done!", parse_mode='HTML')
         return
 
     # Show count if multiple proposals
@@ -187,7 +262,7 @@ async def show_next_proposal(update: Update, user_id: int):
 # ============================================================
 
 def format_proposal(proposal: dict) -> str:
-    """Format a proposal for display to user (hide internal IDs)"""
+    """Format a proposal for display to user with clear before/after for edits"""
     proposal_type = proposal.get("proposal_type", "unknown")
 
     # Human-readable action names
@@ -201,28 +276,111 @@ def format_proposal(proposal: dict) -> str:
         "delete_event": "Delete Event",
     }
 
+    action_name = action_names.get(proposal_type, proposal_type)
+
+    # Handle edit proposals with before/after format
+    if proposal_type == "edit_event":
+        return _format_edit_event_proposal(proposal, action_name)
+    elif proposal_type == "edit_task":
+        return _format_edit_task_proposal(proposal, action_name)
+    else:
+        return _format_simple_proposal(proposal, action_name)
+
+
+def _format_edit_event_proposal(proposal: dict, action_name: str) -> str:
+    """Format edit event proposal with before/after comparison"""
+    lines = [f"**{action_name}**"]
+
+    title = proposal.get("current_title", "Unknown")
+    lines.append(f"  Event: {title}")
+
+    # Current state (datetime string from LLM, e.g. "2025-12-26 10:00-11:00")
+    current_datetime = proposal.get("current_datetime")
+    if current_datetime:
+        lines.append(f"  Currently: {current_datetime}")
+
+    # Changes
+    changes = []
+
+    # Date change
+    if proposal.get("new_date"):
+        changes.append(f"    Date: -> {proposal['new_date']}")
+
+    # Time changes (LLM provides both start and end when changing time)
+    new_start = proposal.get("new_start_time")
+    new_end = proposal.get("new_end_time")
+    if new_start and new_end:
+        changes.append(f"    Time: -> {new_start}-{new_end}")
+    elif new_start:
+        changes.append(f"    Start time: -> {new_start}")
+    elif new_end:
+        changes.append(f"    End time: -> {new_end}")
+
+    # Title change
+    if proposal.get("new_title"):
+        changes.append(f"    Title: -> {proposal['new_title']}")
+
+    # Location change
+    if proposal.get("new_location"):
+        changes.append(f"    Location: -> {proposal['new_location']}")
+
+    # Description change
+    if proposal.get("new_description"):
+        changes.append(f"    Description: -> {proposal['new_description']}")
+
+    if changes:
+        lines.append("  Changes:")
+        lines.extend(changes)
+
+    return "\n".join(lines)
+
+
+def _format_edit_task_proposal(proposal: dict, action_name: str) -> str:
+    """Format edit task proposal with before/after comparison"""
+    lines = [f"**{action_name}**"]
+
+    title = proposal.get("current_title", "Unknown")
+    lines.append(f"  Task: {title}")
+
+    # Changes
+    changes = []
+
+    if proposal.get("new_title"):
+        changes.append(f"    Title: {title} -> {proposal['new_title']}")
+
+    if proposal.get("new_due_date"):
+        changes.append(f"    Due date: {proposal['new_due_date']}")
+
+    if proposal.get("new_notes"):
+        changes.append(f"    Notes: {proposal['new_notes']}")
+
+    if changes:
+        lines.append("  Changes:")
+        lines.extend(changes)
+
+    return "\n".join(lines)
+
+
+def _format_simple_proposal(proposal: dict, action_name: str) -> str:
+    """Format non-edit proposals (create/delete/complete)"""
     # Keys to hide from user (internal IDs)
-    hidden_keys = {"proposal_type", "task_id", "tasklist_id", "event_id"}
+    hidden_keys = {"proposal_type", "task_id", "tasklist_id", "event_id",
+                   "current_title", "current_datetime"}
 
     # Key display names (make more readable)
     key_display = {
-        "current_title": "Current",
-        "current_datetime": "Currently at",
         "task_title": "Task",
         "event_title": "Event",
         "event_datetime": "Scheduled",
-        "new_title": "New title",
-        "new_notes": "New notes",
-        "new_due_date": "New due date",
-        "new_date": "New date",
-        "new_time": "New time",
-        "new_location": "New location",
-        "new_description": "New description",
+        "title": "Title",
+        "date": "Date",
+        "time": "Time",
         "due_date": "Due date",
-        "duration_hours": "Duration (hours)",
+        "duration_minutes": "Duration (min)",
+        "location": "Location",
+        "description": "Description",
+        "notes": "Notes",
     }
-
-    action_name = action_names.get(proposal_type, proposal_type)
 
     # Format details (exclude hidden keys and None values)
     details = []
@@ -248,9 +406,9 @@ async def send_confirmation(update: Update, user_id: int, proposal: dict, prefix
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    message_text = f"{prefix}Proposed action:\n\n{format_proposal(proposal)}\n\nConfirm?"
+    message_text = f"{prefix}Proposed action:\n\n{markdown_to_html(format_proposal(proposal))}\n\nConfirm?"
 
-    await update.message.reply_text(message_text, reply_markup=reply_markup)
+    await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='HTML')
 
 
 async def handle_callback(update: Update, _: ContextTypes.DEFAULT_TYPE):
@@ -289,7 +447,7 @@ async def handle_confirm(query, user_id: int):
     agent_logger.log_tool_execution(f"execute_{proposal.get('proposal_type')}", proposal, result)
 
     # Add tool result to conversation
-    add_message(user_id, llm_handler.create_tool_message(tool_call_id, json.dumps(result)))
+    add_message(user_id, llm_handler.create_tool_message(tool_call_id, json.dumps(result, ensure_ascii=False)))
 
     # Check if there are more proposals in queue
     if queue:
@@ -299,16 +457,17 @@ async def handle_confirm(query, user_id: int):
 
         # Brief acknowledgment + show next proposal
         ack = "Done!" if result.get("success") else f"Error: {result.get('error')}"
-        await query.edit_message_text(ack)
+        await query.edit_message_text(ack, parse_mode='HTML')
         await query.message.reply_text(
-            f"{prefix}Proposed action:\n\n{format_proposal(next_proposal)}\n\nConfirm?",
+            f"{prefix}Proposed action:\n\n{markdown_to_html(format_proposal(next_proposal))}\n\nConfirm?",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("Confirm", callback_data=f"confirm_{user_id}"),
                     InlineKeyboardButton("Cancel", callback_data=f"cancel_{user_id}"),
                 ],
                 [InlineKeyboardButton("Change", callback_data=f"change_{user_id}")]
-            ])
+            ]),
+            parse_mode='HTML'
         )
     else:
         # No more proposals - get LLM response
@@ -329,6 +488,30 @@ async def handle_confirm(query, user_id: int):
                 tool_id = tool_call["id"]
 
                 if tool_name in tools.PROPOSAL_TOOL_NAMES:
+                    # Validate proposal against session state
+                    user_session = session.get_session(user_id)
+                    validation_error = None
+
+                    if tool_name in ("propose_edit_event", "propose_delete_event"):
+                        event_id = tool_args.get("event_id")
+                        if event_id:
+                            valid, error = user_session.validate_event_proposal(event_id)
+                            if not valid:
+                                validation_error = error
+                    elif tool_name in ("propose_edit_task", "propose_delete_task", "propose_complete_task"):
+                        task_id = tool_args.get("task_id")
+                        if task_id:
+                            valid, error = user_session.validate_task_proposal(task_id)
+                            if not valid:
+                                validation_error = error
+
+                    if validation_error:
+                        add_message(user_id, llm_handler.create_tool_message(
+                            tool_id,
+                            json.dumps({"error": validation_error, "action_required": "Fetch fresh data first"}, ensure_ascii=False)
+                        ))
+                        continue
+
                     proposal_tool = next(t for t in tools.PROPOSAL_TOOLS if t.name == tool_name)
                     new_proposal = proposal_tool.invoke(tool_args)
                     proposals_to_queue.append({
@@ -339,21 +522,30 @@ async def handle_confirm(query, user_id: int):
                 else:
                     tool_func = next(t for t in tools.READ_TOOLS if t.name == tool_name)
                     res = tool_func.invoke(tool_args)
-                    add_message(user_id, llm_handler.create_tool_message(tool_id, json.dumps(res)))
+
+                    # Update session state
+                    user_session = session.get_session(user_id)
+                    if tool_name in ("get_calendar_events", "get_today_events"):
+                        user_session.update_from_calendar_read(res)
+                    elif tool_name == "get_tasks":
+                        user_session.update_from_tasks_read(res)
+
+                    add_message(user_id, llm_handler.create_tool_message(tool_id, json.dumps(res, ensure_ascii=False)))
 
             if proposals_to_queue:
                 pending_proposals[user_id] = proposals_to_queue
                 total = len(proposals_to_queue)
                 prefix = f"[1/{total}] " if total > 1 else ""
                 await query.message.reply_text(
-                    f"{prefix}Proposed action:\n\n{format_proposal(proposals_to_queue[0]['proposal'])}\n\nConfirm?",
+                    f"{prefix}Proposed action:\n\n{markdown_to_html(format_proposal(proposals_to_queue[0]['proposal']))}\n\nConfirm?",
                     reply_markup=InlineKeyboardMarkup([
                         [
                             InlineKeyboardButton("Confirm", callback_data=f"confirm_{user_id}"),
                             InlineKeyboardButton("Cancel", callback_data=f"cancel_{user_id}"),
                         ],
                         [InlineKeyboardButton("Change", callback_data=f"change_{user_id}")]
-                    ])
+                    ]),
+                    parse_mode='HTML'
                 )
                 return
 
@@ -361,7 +553,7 @@ async def handle_confirm(query, user_id: int):
         if ai_msg.content:
             add_message(user_id, ai_msg)
             agent_logger.log_final_response(ai_msg.content)
-            await query.message.reply_text(ai_msg.content)
+            await query.message.reply_text(markdown_to_html(ai_msg.content), parse_mode='HTML')
 
 
 async def handle_cancel(query, user_id: int):
@@ -372,7 +564,7 @@ async def handle_cancel(query, user_id: int):
     for item in queue:
         add_message(user_id, llm_handler.create_tool_message(
             item["tool_call_id"],
-            json.dumps({"status": "cancelled", "message": "User cancelled the action"})
+            json.dumps({"status": "cancelled", "message": "User cancelled the action"}, ensure_ascii=False)
         ))
 
     if len(queue) > 1:
@@ -401,15 +593,16 @@ async def handle_change(query, user_id: int):
             "status": "change_requested",
             "message": "User wants to modify this proposal. Ask what they'd like to change.",
             "original_proposal": proposal
-        })
+        }, ensure_ascii=False)
     ))
 
     # Clear all pending proposals (user will make a new request)
     pending_proposals.pop(user_id, None)
 
     await query.edit_message_text(
-        f"Current proposal:\n{format_proposal(proposal)}\n\n"
-        "What would you like to change? (Just type your response)"
+        f"Current proposal:\n{markdown_to_html(format_proposal(proposal))}\n\n"
+        "What would you like to change? (Just type your response)",
+        parse_mode='HTML'
     )
 
 

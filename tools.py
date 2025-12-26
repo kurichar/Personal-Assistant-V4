@@ -70,12 +70,12 @@ def propose_create_task(title: str, notes: str = "", due_date: Optional[str] = N
 def propose_edit_task(
     task_id: str,
     current_title: str,
-    tasklist_id: Optional[str] = None,
+    tasklist_id: str,
     title: Optional[str] = None,
     notes: Optional[str] = None,
     due_date: Optional[str] = None
 ) -> dict:
-    """Propose editing an existing task. User will confirm before changes are made. Use get_tasks first to find the task_id."""
+    """Propose editing an existing task. Call get_tasks first to get task_id, current_title, and tasklist_id."""
     logger.info(f"Proposing to edit task: {current_title}")
     return {
         "proposal_type": "edit_task",
@@ -89,8 +89,8 @@ def propose_edit_task(
 
 
 @tool(args_schema=ProposeDeleteTaskArgs)
-def propose_delete_task(task_id: str, task_title: str, tasklist_id: Optional[str] = None) -> dict:
-    """Propose deleting a task. User will confirm before deletion. Use get_tasks first to find the task_id."""
+def propose_delete_task(task_id: str, task_title: str, tasklist_id: str) -> dict:
+    """Propose deleting a task. Call get_tasks first to get task_id, task_title, and tasklist_id."""
     logger.info(f"Proposing to delete task: {task_title}")
     return {
         "proposal_type": "delete_task",
@@ -101,8 +101,8 @@ def propose_delete_task(task_id: str, task_title: str, tasklist_id: Optional[str
 
 
 @tool(args_schema=ProposeCompleteTaskArgs)
-def propose_complete_task(task_id: str, task_title: str, tasklist_id: Optional[str] = None) -> dict:
-    """Propose marking a task as complete. User will confirm before completion. Use get_tasks first to find the task_id."""
+def propose_complete_task(task_id: str, task_title: str, tasklist_id: str) -> dict:
+    """Propose marking a task as complete. Call get_tasks first to get task_id, task_title, and tasklist_id."""
     logger.info(f"Proposing to complete task: {task_title}")
     return {
         "proposal_type": "complete_task",
@@ -121,7 +121,7 @@ def propose_create_event(
     title: str,
     date: str,
     time: Optional[str] = None,
-    duration_hours: int = 1,
+    duration_minutes: int = 60,
     location: str = "",
     description: str = ""
 ) -> dict:
@@ -132,7 +132,7 @@ def propose_create_event(
         "title": title,
         "date": date,
         "time": time,
-        "duration_hours": duration_hours,
+        "duration_minutes": duration_minutes,
         "location": location,
         "description": description,
     }
@@ -142,31 +142,41 @@ def propose_create_event(
 def propose_edit_event(
     event_id: str,
     current_title: str,
-    current_datetime: Optional[str] = None,
-    title: Optional[str] = None,
-    date: Optional[str] = None,
-    time: Optional[str] = None,
-    location: Optional[str] = None,
-    description: Optional[str] = None
+    current_datetime: str,
+    new_title: Optional[str] = None,
+    new_date: Optional[str] = None,
+    new_start_time: Optional[str] = None,
+    new_end_time: Optional[str] = None,
+    new_description: Optional[str] = None,
+    new_location: Optional[str] = None
 ) -> dict:
-    """Propose editing an existing calendar event. User will confirm before changes. Use get_calendar_events first to find event_id."""
+    """
+    Propose editing an existing calendar event.
+
+    IMPORTANT: Call get_calendar_events first to get event_id, current_title, and current_datetime.
+    When changing time, provide BOTH new_start_time AND new_end_time.
+    """
     logger.info(f"Proposing to edit event: {current_title}")
+
+    # Pure function - just return the proposal, no API calls
+    # LLM must provide current_* fields from get_calendar_events results
     return {
         "proposal_type": "edit_event",
         "event_id": event_id,
         "current_title": current_title,
         "current_datetime": current_datetime,
-        "new_title": title,
-        "new_date": date,
-        "new_time": time,
-        "new_location": location,
-        "new_description": description,
+        "new_title": new_title,
+        "new_date": new_date,
+        "new_start_time": new_start_time,
+        "new_end_time": new_end_time,
+        "new_description": new_description,
+        "new_location": new_location,
     }
 
 
 @tool(args_schema=ProposeDeleteEventArgs)
-def propose_delete_event(event_id: str, event_title: str, event_datetime: Optional[str] = None) -> dict:
-    """Propose deleting a calendar event. User will confirm before deletion. Use get_calendar_events first to find event_id."""
+def propose_delete_event(event_id: str, event_title: str, event_datetime: str) -> dict:
+    """Propose deleting a calendar event. Call get_calendar_events first to get event_id, event_title, and event_datetime."""
     logger.info(f"Proposing to delete event: {event_title}")
     return {
         "proposal_type": "delete_event",
@@ -257,7 +267,7 @@ def execute_confirmed_proposal(proposal: dict) -> dict:
                 title=proposal["title"],
                 date=proposal["date"],
                 time=proposal.get("time"),
-                duration_hours=proposal.get("duration_hours", 1),
+                duration_minutes=proposal.get("duration_minutes", 60),
                 location=proposal.get("location", ""),
                 description=proposal.get("description", ""),
             )
@@ -267,9 +277,10 @@ def execute_confirmed_proposal(proposal: dict) -> dict:
                 event_id=proposal["event_id"],
                 title=proposal.get("new_title"),
                 date=proposal.get("new_date"),
-                time=proposal.get("new_time"),
-                location=proposal.get("new_location"),
+                start_time=proposal.get("new_start_time"),
+                end_time=proposal.get("new_end_time"),
                 description=proposal.get("new_description"),
+                location=proposal.get("new_location")
             )
 
         elif proposal_type == "delete_event":

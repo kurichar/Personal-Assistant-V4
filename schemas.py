@@ -48,11 +48,10 @@ class ProposeEditTaskArgs(BaseModel):
         description="The ID of the task to edit (from get_tasks)"
     )
     current_title: str = Field(
-        description="The current title of the task (for user to see what's being edited)"
+        description="The current title of the task (from get_tasks)"
     )
-    tasklist_id: Optional[str] = Field(
-        default=None,
-        description="The task list ID (from get_tasks, uses default if not provided)"
+    tasklist_id: str = Field(
+        description="The task list ID (from get_tasks)"
     )
     title: Optional[str] = Field(
         default=None,
@@ -76,10 +75,9 @@ class ProposeDeleteTaskArgs(BaseModel):
         description="The ID of the task to delete (from get_tasks)"
     )
     task_title: str = Field(
-        description="The title of the task being deleted (for user confirmation)"
+        description="The title of the task being deleted (from get_tasks)"
     )
-    tasklist_id: Optional[str] = Field(
-        default=None,
+    tasklist_id: str = Field(
         description="The task list ID (from get_tasks)"
     )
 
@@ -90,10 +88,9 @@ class ProposeCompleteTaskArgs(BaseModel):
         description="The ID of the task to complete (from get_tasks)"
     )
     task_title: str = Field(
-        description="The title of the task being completed (for user confirmation)"
+        description="The title of the task being completed (from get_tasks)"
     )
-    tasklist_id: Optional[str] = Field(
-        default=None,
+    tasklist_id: str = Field(
         description="The task list ID (from get_tasks)"
     )
 
@@ -117,11 +114,11 @@ class ProposeCreateEventArgs(BaseModel):
         pattern=r"^\d{2}:\d{2}$",
         description="Event time in HH:MM 24-hour format (e.g., 14:30). Omit for all-day event."
     )
-    duration_hours: int = Field(
-        default=1,
-        ge=1,
-        le=24,
-        description="Event duration in hours (1-24)"
+    duration_minutes: int = Field(
+        default=60,
+        ge=5,
+        le=1440,
+        description="Event duration in minutes (5-1440, i.e., 5 min to 24 hours). Examples: 15, 30, 60, 90, 120"
     )
     location: str = Field(
         default="",
@@ -134,39 +131,42 @@ class ProposeCreateEventArgs(BaseModel):
 
 
 class ProposeEditEventArgs(BaseModel):
-    """Arguments for proposing to edit an existing calendar event"""
+    """Arguments for proposing to edit a calendar event"""
     event_id: str = Field(
         description="The ID of the event to edit (from get_calendar_events)"
     )
     current_title: str = Field(
-        description="The current title of the event (for user to see what's being edited)"
+        description="Current title of the event (from get_calendar_events)"
     )
-    current_datetime: Optional[str] = Field(
-        default=None,
-        description="The current date/time of the event (for user context)"
+    current_datetime: str = Field(
+        description="Current date/time of the event (from get_calendar_events 'start' field)"
     )
-    title: Optional[str] = Field(
+    new_title: Optional[str] = Field(
         default=None,
-        min_length=1,
         description="New title for the event"
     )
-    date: Optional[str] = Field(
+    new_date: Optional[str] = Field(
         default=None,
         pattern=r"^\d{4}-\d{2}-\d{2}$",
         description="New date in YYYY-MM-DD format"
     )
-    time: Optional[str] = Field(
+    new_start_time: Optional[str] = Field(
         default=None,
         pattern=r"^\d{2}:\d{2}$",
-        description="New time in HH:MM 24-hour format"
+        description="New start time in HH:MM format (24-hour). Provide with new_end_time."
     )
-    location: Optional[str] = Field(
+    new_end_time: Optional[str] = Field(
         default=None,
-        description="New location"
+        pattern=r"^\d{2}:\d{2}$",
+        description="New end time in HH:MM format (24-hour). Provide with new_start_time."
     )
-    description: Optional[str] = Field(
+    new_description: Optional[str] = Field(
         default=None,
-        description="New description"
+        description="New description for the event"
+    )
+    new_location: Optional[str] = Field(
+        default=None,
+        description="New location for the event"
     )
 
 
@@ -176,9 +176,8 @@ class ProposeDeleteEventArgs(BaseModel):
         description="The ID of the event to delete (from get_calendar_events)"
     )
     event_title: str = Field(
-        description="The title of the event being deleted (for user confirmation)"
+        description="The title of the event being deleted (from get_calendar_events)"
     )
-    event_datetime: Optional[str] = Field(
-        default=None,
-        description="The date/time of the event (for user context)"
+    event_datetime: str = Field(
+        description="The date/time of the event (from get_calendar_events 'start' field)"
     )
