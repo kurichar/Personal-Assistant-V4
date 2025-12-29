@@ -22,6 +22,8 @@ import llm_handler
 import tools
 import agent_logger
 import session
+import database
+import scheduler
 
 
 # ============================================================
@@ -107,9 +109,65 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_proposals.pop(user_id, None)
     session.clear_session(user_id)  # Clear session state (cached IDs, freshness)
 
+    # Create user in database if not exists
+    if not database.get_user(user_id):
+        database.create_user(user_id)
+        logger.info(f"Created new user record for {user_id}")
+
     await update.message.reply_text(
         "Hi! I'm your personal assistant. I can help you manage your calendar and tasks.\n"
-        "Just talk to me naturally and I'll do my best to help!",
+        "Just talk to me naturally and I'll do my best to help!\n\n"
+        "Use /settings to configure notifications.",
+        parse_mode='HTML'
+    )
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /settings command - show and modify notification preferences"""
+    user_id = update.effective_user.id
+
+    # Get or create user
+    user = database.get_user(user_id)
+    if not user:
+        user = database.create_user(user_id)
+
+    # Build settings display
+    briefing_status = "On" if user['briefing_enabled'] else "Off"
+    reminders_status = "On" if user['reminders_enabled'] else "Off"
+    nudges_status = "On" if user['nudges_enabled'] else "Off"
+
+    text = f"""<b>Notification Settings</b>
+
+<b>Daily Briefing:</b> {briefing_status}
+  Time: {user['briefing_time']}
+
+<b>Event Reminders:</b> {reminders_status}
+  (30 min before events)
+
+<b>Overdue Task Nudges:</b> {nudges_status}
+
+<b>Timezone:</b> {user['timezone']}
+
+Tap a button to toggle:"""
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'Disable' if user['briefing_enabled'] else 'Enable'} Briefing",
+            callback_data="settings_toggle_briefing"
+        )],
+        [InlineKeyboardButton(
+            f"{'Disable' if user['reminders_enabled'] else 'Enable'} Reminders",
+            callback_data="settings_toggle_reminders"
+        )],
+        [InlineKeyboardButton(
+            f"{'Disable' if user['nudges_enabled'] else 'Enable'} Nudges",
+            callback_data="settings_toggle_nudges"
+        )],
+    ]
+
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='HTML'
     )
 
@@ -411,8 +469,8 @@ async def send_confirmation(update: Update, user_id: int, proposal: dict, prefix
     await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='HTML')
 
 
-async def handle_callback(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    """Handle button presses (Confirm/Cancel/Change)"""
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button presses (Confirm/Cancel/Change/Settings)"""
     query = update.callback_query
     await query.answer()
 
@@ -425,6 +483,8 @@ async def handle_callback(update: Update, _: ContextTypes.DEFAULT_TYPE):
         await handle_cancel(query, user_id)
     elif data.startswith("change_"):
         await handle_change(query, user_id)
+    elif data.startswith("settings_toggle_"):
+        await handle_settings_toggle(query, user_id, data, context)
 
 
 async def handle_confirm(query, user_id: int):
@@ -606,18 +666,100 @@ async def handle_change(query, user_id: int):
     )
 
 
+async def handle_settings_toggle(query, user_id: int, data: str, context: ContextTypes.DEFAULT_TYPE):
+    """Handle settings toggle button presses"""
+    user = database.get_user(user_id)
+    if not user:
+        await query.edit_message_text("Error: User not found. Use /start first.")
+        return
+
+    # Determine which setting to toggle
+    if data == "settings_toggle_briefing":
+        new_value = 0 if user['briefing_enabled'] else 1
+        database.update_user(user_id, briefing_enabled=new_value)
+
+        # Schedule or remove briefing job
+        if new_value:
+            scheduler.schedule_user_briefing(
+                context.application,
+                user_id,
+                user['briefing_time'],
+                user['timezone']
+            )
+        else:
+            scheduler.remove_user_briefing(context.application, user_id)
+
+    elif data == "settings_toggle_reminders":
+        new_value = 0 if user['reminders_enabled'] else 1
+        database.update_user(user_id, reminders_enabled=new_value)
+
+    elif data == "settings_toggle_nudges":
+        new_value = 0 if user['nudges_enabled'] else 1
+        database.update_user(user_id, nudges_enabled=new_value)
+
+    # Refresh and show updated settings
+    user = database.get_user(user_id)
+    briefing_status = "On" if user['briefing_enabled'] else "Off"
+    reminders_status = "On" if user['reminders_enabled'] else "Off"
+    nudges_status = "On" if user['nudges_enabled'] else "Off"
+
+    text = f"""<b>Notification Settings</b>
+
+<b>Daily Briefing:</b> {briefing_status}
+  Time: {user['briefing_time']}
+
+<b>Event Reminders:</b> {reminders_status}
+  (30 min before events)
+
+<b>Overdue Task Nudges:</b> {nudges_status}
+
+<b>Timezone:</b> {user['timezone']}
+
+Tap a button to toggle:"""
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'Disable' if user['briefing_enabled'] else 'Enable'} Briefing",
+            callback_data="settings_toggle_briefing"
+        )],
+        [InlineKeyboardButton(
+            f"{'Disable' if user['reminders_enabled'] else 'Enable'} Reminders",
+            callback_data="settings_toggle_reminders"
+        )],
+        [InlineKeyboardButton(
+            f"{'Disable' if user['nudges_enabled'] else 'Enable'} Nudges",
+            callback_data="settings_toggle_nudges"
+        )],
+    ]
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
+
+
 # ============================================================
 # BOT STARTUP
 # ============================================================
 
 def run_bot():
     """Start the Telegram bot"""
+    # Initialize database
+    database.init_db()
+    logger.info("Database initialized")
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Set up scheduled jobs for proactive notifications
+    scheduler.setup_scheduled_jobs(application)
+    logger.info("Scheduled jobs initialized")
 
     logger.info("Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
