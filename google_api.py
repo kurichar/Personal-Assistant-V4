@@ -328,6 +328,34 @@ def get_tasks():
         return []
 
 
+def get_overdue_tasks():
+    """
+    Get tasks that are past their due date.
+
+    Returns:
+        List of overdue tasks
+    """
+    tasks = get_tasks()
+    today = datetime.now(ZoneInfo("Asia/Jerusalem")).date()
+
+    overdue = []
+    for task in tasks:
+        due_str = task.get('due', '')
+        if not due_str:
+            continue
+
+        try:
+            # Parse ISO format due date (e.g., "2025-12-25T00:00:00.000Z")
+            due_date = datetime.fromisoformat(due_str.replace('Z', '+00:00')).date()
+            if due_date < today:
+                overdue.append(task)
+        except (ValueError, AttributeError):
+            continue
+
+    logger.info(f"Found {len(overdue)} overdue tasks")
+    return overdue
+
+
 def get_default_tasklist_id():
     """Get the ID of the default task list"""
     try:
